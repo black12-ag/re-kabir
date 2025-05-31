@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables
+.env
+.env.*
+
+# Log files
+*.log
+bot_output.log
+bot_error.log
+bot_monitor.log
+
+# Database files
+*.db
+*.sqlite3
+
+# Virtual environment
+.venv/
+venv/
+.venv311/
+venv_py311/
+
+# macOS
+.DS_Store
+
+# Editor directories
+.idea/
+.vscode/
+
+.qodo
+*.pyc
+*.venv*/
+venv*/
+*.zip

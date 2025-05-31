@@ -1,0 +1,1246 @@
+import logging
+import os
+import sys
+import re
+import time
+import json
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, InputMediaPhoto, InputMediaVideo, ParseMode, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import CallbackContext, ConversationHandler, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
+
+from utils.api_client import api_client
+from utils.db import db
+from utils.helpers import is_admin
+from utils.constants import CURRENCY_RATES
+from utils.messages import get_message
+from datetime import datetime, timedelta
+from handlers.start import show_main_menu
+
+# Define states
+ADMIN_MENU = 0
+BROADCASTING = 1
+VIEWING_STATS = 2
+ADDING_BALANCE = 3
+REMOVING_BALANCE = 4
+ENTERING_USER_ID = 5
+ENTERING_BALANCE_AMOUNT = 6
+ENTERING_REFERRAL_SETTINGS = 7
+REMOVING_BALANCE_OPTIONS = 8
+CUSTOMIZING_WELCOME = 9
+ENTERING_WELCOME_TEXT = 10
+ENTERING_BUTTON_TEXT = 11
+ENTERING_BUTTON_URL = 12
+BROADCAST_MEDIA_TYPE = 13
+BROADCAST_COLLECTION = 14
+WAITING_FOR_WELCOME_MEDIA = 15  # New state for waiting for media uploads
+ENTERING_BROADCAST_TEXT = 16
+ENTERING_SERVICE_ID = 17
+ENTERING_SERVICE_PRICE = 18
+ENTERING_CURRENCY_RATE = 19
+ENTERING_PRICE_RANGE = 20
+ENTERING_BONUS_AMOUNT = 21
+BROADCAST_CONTENT = 22
+MANAGING_SERVICE_PRICES = 23
+
+# Module logger
+logger = logging.getLogger(__name__)
+
+def admin_command(update: Update, context: CallbackContext):
+    """Handler for /admin command - only admins can use this"""
+    user = update.effective_user
+    
+    # Check if user is admin
+    if not is_admin(user.id):
+        update.message.reply_text("❌ You don't have permission to use this command.")
+        return ConversationHandler.END
+    
+    # Create admin menu
+    keyboard = [
+        [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("💰 Manage Balance", callback_data="admin_manage_balance")],
+        [InlineKeyboardButton("🎁 New User Bonus", callback_data="admin_new_user_bonus")],
+        [InlineKeyboardButton("💱 Currency Rates", callback_data="admin_currency_rates")],
+        [InlineKeyboardButton("🏷️ Service Prices", callback_data="admin_service_prices")],
+        [InlineKeyboardButton("👥 Check User Referrals", callback_data="admin_check_user_referrals")],
+        [InlineKeyboardButton("🎁 Referral Bonuses", callback_data="admin_referral_bonuses")],
+        [InlineKeyboardButton("⚙️ Referral Settings", callback_data="admin_referral_settings")],
+        [InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("❌ Exit", callback_data="admin_exit")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    update.message.reply_text(
+        f"👑 Admin Panel\n\n"
+        f"Welcome to the admin panel, {user.first_name}.\n"
+        f"Please select an option:",
+        reply_markup=reply_markup
+    )
+    
+    return ADMIN_MENU
+
+def admin_menu_callback(update: Update, context: CallbackContext):
+    """Handle admin menu callbacks"""
+    query = update.callback_query
+    option = query.data
+    user_id = update.effective_user.id
+    user = update.effective_user  # Define user at the top of the function
+    
+    # Add a new option for managing new user bonus
+    if option == "admin_new_user_bonus":
+        # Show new user bonus settings
+        status = db.get_new_user_bonus_status()
+        amount = db.get_new_user_bonus_amount()
+        currency = db.get_new_user_bonus_currency()
+        username_required = db.get_new_user_bonus_username_required()
+        
+        status_text = "✅ Enabled" if status else "❌ Disabled"
+        username_text = "✅ Required" if username_required else "❌ Not Required"
+        
+        keyboard = [
+            [InlineKeyboardButton(f"Toggle Status ({status_text})", callback_data="admin_toggle_new_user_bonus")],
+            [InlineKeyboardButton(f"Username Required ({username_text})", callback_data="admin_toggle_username_required")],
+            [InlineKeyboardButton("Set Bonus Amount", callback_data="admin_set_bonus_amount")],
+            [InlineKeyboardButton("Set Bonus Currency", callback_data="admin_set_bonus_currency")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            f"🎁 <b>New User Bonus Settings</b>\n\n"
+            f"Status: {status_text}\n"
+            f"Username Required: {username_text}\n"
+            f"Amount: {amount} {currency}\n\n"
+            f"Configure the bonus given to new users when they first join.",
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+        return ADMIN_MENU
+    
+    elif option == "admin_toggle_new_user_bonus":
+        # Toggle new user bonus status
+        current_status = db.get_new_user_bonus_status()
+        new_status = not current_status
+        db.set_new_user_bonus_status(new_status)
+        
+        status_text = "✅ Enabled" if new_status else "❌ Disabled"
+        
+        query.answer(f"New user bonus {status_text}")
+        
+        # Return to the new user bonus menu
+        return admin_menu_callback(update, context)
+    
+    elif option == "admin_toggle_username_required":
+        # Toggle username requirement for new user bonus
+        current_status = db.get_new_user_bonus_username_required()
+        new_status = not current_status
+        db.set_new_user_bonus_username_required(new_status)
+        
+        status_text = "✅ Required" if new_status else "❌ Not Required"
+        
+        query.answer(f"Username requirement {status_text}")
+        
+        # Return to the new user bonus menu
+        return admin_menu_callback(update, context)
+    
+    elif option == "admin_set_bonus_amount":
+        # Show form to set bonus amount
+        query.edit_message_text(
+            "🎁 <b>Set New User Bonus Amount</b>\n\n"
+            "Please enter the amount for the new user bonus:",
+            parse_mode="HTML"
+        )
+        context.user_data['admin_action'] = 'set_bonus_amount'
+        return ENTERING_BONUS_AMOUNT
+    
+    elif option == "admin_set_bonus_currency":
+        # Show currency options
+        keyboard = [
+            [
+                InlineKeyboardButton("USD", callback_data="admin_bonus_currency_USD"),
+                InlineKeyboardButton("ETB", callback_data="admin_bonus_currency_ETB")
+            ],
+            [
+                InlineKeyboardButton("EUR", callback_data="admin_bonus_currency_EUR"),
+                InlineKeyboardButton("GBP", callback_data="admin_bonus_currency_GBP")
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin_new_user_bonus")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            "🎁 <b>Set New User Bonus Currency</b>\n\n"
+            "Please select the currency for the new user bonus:",
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+        return ADMIN_MENU
+    
+    elif option.startswith("admin_bonus_currency_"):
+        # Handle currency selection
+        currency = option.replace("admin_bonus_currency_", "")
+        db.set_new_user_bonus_currency(currency)
+        
+        query.answer(f"New user bonus currency set to {currency}")
+        
+        # Return to the new user bonus menu
+        return admin_menu_callback(update, context)
+    
+    # Add 'New User Bonus' option to the main admin menu in the existing code
+    elif option == "admin_main_menu" or option == "admin_back":
+        # Admin main menu
+        user = update.effective_user  # Add this line to define the user variable
+        keyboard = [
+            [InlineKeyboardButton("📊 View Stats", callback_data="admin_stats")],
+            [InlineKeyboardButton("📣 Broadcast Message", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("💰 Manage Balance", callback_data="admin_manage_balance")],
+            [InlineKeyboardButton("🎁 New User Bonus", callback_data="admin_new_user_bonus")],
+            [InlineKeyboardButton("💱 Currency Rates", callback_data="admin_currency_rates")],
+            [InlineKeyboardButton("🏷️ Service Prices", callback_data="admin_service_prices")],
+            [InlineKeyboardButton("👥 Check User Referrals", callback_data="admin_check_user_referrals")],
+            [InlineKeyboardButton("🎁 Referral Bonuses", callback_data="admin_referral_bonuses")],
+            [InlineKeyboardButton("⚙️ Referral Settings", callback_data="admin_referral_settings")],
+            [InlineKeyboardButton("❌ Exit", callback_data="admin_exit")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            f"👑 Admin Panel\n\n"
+            f"Welcome to the admin panel, {user.first_name}.\n"
+            f"Please select an option:",
+            reply_markup=reply_markup
+        )
+        return ADMIN_MENU
+    
+    elif option == "admin_stats":
+        # Show statistics
+        return show_stats(update, context)
+    
+    elif option == "admin_view_all_users":
+        # Show all users
+        return show_all_users(update, context, page=1)
+    
+    elif option == "admin_view_active_users":
+        # Show active users
+        return show_active_users(update, context, page=1)
+    
+    elif option == "admin_view_all_orders":
+        # Show all orders
+        return show_all_orders(update, context, page=1)
+    
+    elif option == "admin_view_recent_orders":
+        # Show recent orders
+        return show_recent_orders(update, context, page=1)
+    
+    elif option.startswith("admin_users_page_"):
+        # Handle user list pagination
+        page = int(option.split("_")[-1])
+        return show_all_users(update, context, page)
+    
+    elif option.startswith("admin_active_users_page_"):
+        # Handle active user list pagination
+        page = int(option.split("_")[-1])
+        return show_active_users(update, context, page)
+    
+    elif option.startswith("admin_orders_page_"):
+        # Handle order list pagination
+        page = int(option.split("_")[-1])
+        return show_all_orders(update, context, page)
+    
+    elif option.startswith("admin_recent_orders_page_"):
+        # Handle recent order list pagination
+        page = int(option.split("_")[-1])
+        return show_recent_orders(update, context, page)
+    
+    elif option == "admin_broadcast":
+        # Start broadcast flow
+        keyboard = [
+            [InlineKeyboardButton("📝 Text Message", callback_data="broadcast_type_text")],
+            [InlineKeyboardButton("🖼️ Photo", callback_data="broadcast_type_photo")],
+            [InlineKeyboardButton("🎬 Video", callback_data="broadcast_type_video")],
+            [InlineKeyboardButton("🔊 Voice/Audio", callback_data="broadcast_type_audio")],
+            [InlineKeyboardButton("📁 Document/File", callback_data="broadcast_type_document")],
+            [InlineKeyboardButton("📱 Media Collection", callback_data="broadcast_type_collection")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_back")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            "📢 Broadcast Message\n\n"
+            "Please select the type of content you want to broadcast to all users:",
+            reply_markup=reply_markup
+        )
+        return BROADCAST_MEDIA_TYPE
+    
+    elif option == "admin_manage_balance":
+        # Show balance management options
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Balance", callback_data="admin_add_balance")],
+            [InlineKeyboardButton("➖ Remove Balance", callback_data="admin_remove_balance")],
+            [InlineKeyboardButton("👀 View User Balance", callback_data="admin_view_balance")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            "💰 Balance Management\n\n"
+            "Select an action:",
+            reply_markup=reply_markup
+        )
+        return ADMIN_MENU
+    
+    elif option == "admin_currency_rates":
+        # Show currency rates management
+        return show_currency_rates(update, context)
+    
+    elif option.startswith("admin_edit_rate_"):
+        # Handle currency rate editing
+        currency = option.replace("admin_edit_rate_", "")
+        query.edit_message_text(
+            f"💱 Edit Exchange Rate for {currency}\n\n"
+            f"Please enter the new exchange rate for {currency}:\n"
+            f"(Current rate will be shown on confirmation)"
+        )
+        context.user_data['edit_currency'] = currency
+        return ENTERING_CURRENCY_RATE
+    
+    elif option == "admin_service_prices":
+        # Show service price management options
+        return show_service_price_options(update, context)
+    
+    elif option == "admin_edit_single_service":
+        # Edit price for a single service
+        query.edit_message_text(
+            "🏷️ Edit Single Service Price\n\n"
+            "Please enter the service ID to edit its price:"
+        )
+        return ENTERING_SERVICE_ID
+    
+    elif option == "admin_edit_price_range":
+        # Edit prices for services in a price range
+        return show_price_range_form(update, context)
+    
+    elif option == "admin_view_price_overrides":
+        # View all price overrides
+        return show_price_overrides(update, context)
+    
+    elif option.startswith("admin_reset_price_"):
+        # Reset price for a service
+        service_id = option.replace("admin_reset_price_", "")
+        return reset_service_price(update, context, service_id)
+    
+    elif option == "admin_referral_bonuses":
+        # Show pending referral bonuses
+        return show_referral_bonuses(update, context)
+    
+    elif option == "admin_referral_settings":
+        # Show referral settings
+        return show_referral_settings(update, context)
+    
+    elif option == "admin_check_user_referrals":
+        # Check user referrals
+        query.edit_message_text(
+            "👥 Check User Referrals\n\n"
+            "Enter the user ID to check their referrals:"
+        )
+        context.user_data['admin_action'] = 'check_referrals'
+        return ENTERING_USER_ID
+    
+    elif option == "admin_add_balance":
+        # Start add balance flow
+        query.edit_message_text(
+            "➕ Add Balance\n\n"
+            "Please enter the user ID to add balance to:"
+        )
+        context.user_data["admin_action"] = "add_balance"
+        context.user_data["admin_target_user_id"] = None
+        context.user_data["admin_balance_currency"] = "USD"  # Default currency
+        return ENTERING_USER_ID
+    
+    elif option == "admin_view_balance":
+        # Start view balance flow
+        query.edit_message_text(
+            "👀 View Balance\n\n"
+            "Enter the user ID to view balance:"
+        )
+        context.user_data["admin_action"] = "view_balance"
+        return ENTERING_USER_ID
+    
+    elif option == "admin_remove_balance":
+        # Start remove balance flow
+        query.edit_message_text(
+            "➖ Remove Balance\n\n"
+            "Please enter the user ID to remove balance from:"
+        )
+        context.user_data["admin_action"] = "remove_balance"
+        context.user_data["admin_target_user_id"] = None
+        return ENTERING_USER_ID
+    
+    elif option == "admin_back":
+        # Go back to main admin menu
+        user = update.effective_user
+        
+        # Create admin menu
+        keyboard = [
+            [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
+            [InlineKeyboardButton("💰 Manage Balance", callback_data="admin_manage_balance")],
+            [InlineKeyboardButton("🎁 New User Bonus", callback_data="admin_new_user_bonus")],
+            [InlineKeyboardButton("💱 Currency Rates", callback_data="admin_currency_rates")],
+            [InlineKeyboardButton("🏷️ Service Prices", callback_data="admin_service_prices")],
+            [InlineKeyboardButton("👥 Check User Referrals", callback_data="admin_check_user_referrals")],
+            [InlineKeyboardButton("🎁 Referral Bonuses", callback_data="admin_referral_bonuses")],
+            [InlineKeyboardButton("⚙️ Referral Settings", callback_data="admin_referral_settings")],
+            [InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("❌ Exit", callback_data="admin_exit")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            f"👑 Admin Panel\n\n"
+            f"Welcome to the admin panel, {user.first_name}.\n"
+            f"Please select an option:",
+            reply_markup=reply_markup
+        )
+        return ADMIN_MENU
+    
+    elif option == "admin_exit":
+        # Exit admin mode
+        query.edit_message_text("You have exited the admin panel.")
+        return ConversationHandler.END
+        
+    elif option == "admin_welcome_customize":
+        # Show welcome message customization menu
+        return show_welcome_customize_menu(update, context)
+        
+    # Handle admin back action
+    elif option == "admin_back":
+        # Go back to main admin menu
+        return admin_command(update, context)
+    
+    # Handle referral bonus actions
+    elif option.startswith("admin_approve_bonus_"):
+        bonus_id = option.split("_")[-1]
+        return process_referral_bonus(update, context, bonus_id, "approved")
+    
+    elif option.startswith("admin_decline_bonus_"):
+        bonus_id = option.split("_")[-1]
+        return process_referral_bonus(update, context, bonus_id, "declined")
+    
+    # Handle user referral pagination
+    elif option.startswith("ref_admin_page_"):
+        # Extract page number and user_id
+        parts = option.split("_")
+        page = int(parts[3])
+        user_id = int(parts[4])
+        return show_user_referrals(update, context, user_id, page)
+    
+    # Handle referral settings actions
+    elif option == "admin_set_referral_threshold":
+        query.edit_message_text(
+            "🔢 Set Referral Threshold\n\n"
+            "Enter the number of referrals required to earn a bonus:"
+        )
+        context.user_data["admin_setting"] = "referral_threshold"
+        return ENTERING_REFERRAL_SETTINGS
+    
+    elif option == "admin_set_bonus_amount":
+        query.edit_message_text(
+            "💵 Set Bonus Amount\n\n"
+            "Enter the bonus amount in ETB:"
+        )
+        context.user_data["admin_setting"] = "bonus_amount"
+        return ENTERING_REFERRAL_SETTINGS
+    
+    # Add specific handler for direct set new user bonus amount
+    elif option == "admin_set_new_user_bonus":
+        # Show new user bonus settings directly
+        status = db.get_new_user_bonus_status()
+        amount = db.get_new_user_bonus_amount()
+        currency = db.get_new_user_bonus_currency()
+        
+        status_text = "✅ Enabled" if status else "❌ Disabled"
+        
+        # Create the keyboard with options
+        keyboard = [
+            [InlineKeyboardButton("Set Amount", callback_data="admin_set_bonus_amount")],
+            [InlineKeyboardButton(f"Status: {status_text}", callback_data="admin_toggle_new_user_bonus")],
+            [InlineKeyboardButton(f"Currency: {currency}", callback_data="admin_set_bonus_currency")],
+            [InlineKeyboardButton("⬅️ Back to Balance", callback_data="admin_manage_balance")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            f"🎁 <b>New User Bonus Settings</b>\n\n"
+            f"Current Status: {status_text}\n"
+            f"Current Amount: {amount} {currency}\n\n"
+            f"Configure the bonus given to new users when they first join.",
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+        return ADMIN_MENU
+    
+    # Handle view balance action from user_data
+    elif context.user_data.get('admin_action') == 'view_balance':
+        # Look up user's balance
+        user_id = context.user_data.get('target_user_id')
+        username_display = context.user_data.get('username_display', 'No username')
+        
+        if not user_id:
+            query.edit_message_text("❌ Error: User ID not found. Please try again.")
+            return ConversationHandler.END
+            
+        user_balance = db.get_balance(user_id)
+        
+        # Get ETB rate
+        etb_rate = db.get_currency_rate("etb", 30.0)  # Default ETB rate if not set
+        
+        # Calculate ETB equivalent
+        etb_balance = user_balance * etb_rate
+        formatted_etb = f"{etb_balance:,.0f}"
+        
+        # Show balance in both currencies
+        update.message.reply_html(
+            f"💰 <b>User Balance</b>\n\n"
+            f"User ID: <code>{user_id}</code>\n"
+            f"Username: {username_display}\n"
+            f"🇺🇸 USD Balance: <code>${user_balance:.2f}</code>\n"
+            f"🇪🇹 ETB Balance: <code>ETB {formatted_etb}</code>\n\n"
+            f"What would you like to do next?"
+        )
+        return ConversationHandler.END
+    
+    else:
+        query.edit_message_text("❌ Invalid option.")
+        return ConversationHandler.END
+
+def show_stats(update: Update, context: CallbackContext):
+    """Show bot statistics"""
+    query = update.callback_query
+    
+    # Get statistics from database
+    total_users = db.get_total_users()
+    active_users = db.get_active_users(days=7)
+    total_orders = db.get_total_orders()
+    recent_orders = db.get_recent_orders(days=7)
+    
+    # Format statistics message
+    stats_message = (
+        f"📊 <b>Bot Statistics</b>\n\n"
+        f"👥 Total Users: {total_users}\n"
+        f"👤 Active Users (7d): {active_users}\n"
+        f"📦 Total Orders: {total_orders}\n"
+        f"📦 Recent Orders (7d): {recent_orders}\n"
+    )
+    
+    # Create keyboard with detailed view buttons
+    keyboard = [
+        [InlineKeyboardButton("👥 View All Users", callback_data="admin_view_all_users")],
+        [InlineKeyboardButton("👤 View Active Users", callback_data="admin_view_active_users")],
+        [InlineKeyboardButton("📦 View All Orders", callback_data="admin_view_all_orders")],
+        [InlineKeyboardButton("📦 View Recent Orders", callback_data="admin_view_recent_orders")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    query.edit_message_text(stats_message, reply_markup=reply_markup, parse_mode="HTML")
+    
+    return ADMIN_MENU
+
+def handle_user_id_input(update: Update, context: CallbackContext):
+    """Handle user ID or username input for various admin actions"""
+    user_input = update.message.text.strip()
+    
+    # Check if input is a numeric ID or a username
+    is_numeric = False
+    try:
+        user_id = int(user_input)
+        is_numeric = True
+    except ValueError:
+        # Input might be a username
+        pass
+    
+    # Look up user based on input type
+    user_data = None
+    if is_numeric:
+        # Lookup by user ID
+        user_data = db.get_user(user_id)
+        if user_data:
+            user_id = user_data['user_id']
+    else:
+        # Strip @ if present in username
+        if user_input.startswith('@'):
+            user_input = user_input[1:]
+            
+        # Lookup by username
+        user_data = db.get_user_by_username(user_input)
+        if user_data:
+            user_id = user_data['user_id']
+    
+    if not user_data:
+        update.message.reply_text(
+            "❌ User not found. Please enter a valid user ID or username."
+        )
+        return ENTERING_USER_ID
+    
+    # Store user ID in context
+    context.user_data['target_user_id'] = user_id
+    context.user_data['target_user_data'] = user_data
+    
+    # Get username for display
+    username = user_data.get('username', 'None')
+    username_display = f"@{username}" if username else "No username"
+    context.user_data['username_display'] = username_display
+    
+    # Check which action we're performing
+    admin_action = context.user_data.get('admin_action')
+    
+    if admin_action == 'add_balance':
+        # Continue with add balance flow
+        # Get balance in both currencies for display
+        balance = user_data.get('balance', 0)
+        etb_rate = db.get_currency_rate("etb", 30.0)
+        etb_balance = balance * etb_rate
+        formatted_etb = f"{etb_balance:,.0f}"
+        
+        update.message.reply_text(
+            f"User found: {user_data.get('first_name', '')} {user_data.get('last_name', '')}\n"
+            f"Username: {username_display}\n"
+            f"Current balance: ${balance:.2f} (≈ETB {formatted_etb})\n\n"
+            f"Enter the amount to add to the user's balance:\n"
+            f"You can specify currency by adding ETB or USD (e.g., '10 USD' or '300 ETB')"
+        )
+        return ENTERING_BALANCE_AMOUNT
+        
+    elif admin_action == 'remove_balance':
+        # Continue with remove balance flow
+        # Get balance in both currencies for display
+        balance = user_data.get('balance', 0)
+        etb_rate = db.get_currency_rate("etb", 30.0)
+        etb_balance = balance * etb_rate
+        formatted_etb = f"{etb_balance:,.0f}"
+        
+        update.message.reply_text(
+            f"User found: {user_data.get('first_name', '')} {user_data.get('last_name', '')}\n"
+            f"Username: {username_display}\n"
+            f"Current balance: ${balance:.2f} (≈ETB {formatted_etb})\n\n"
+            f"Enter the amount to remove from the user's balance:\n"
+            f"You can specify currency by adding ETB or USD (e.g., '10 USD' or '300 ETB')"
+        )
+        return ENTERING_BALANCE_AMOUNT
+        
+    elif admin_action == 'view_balance':
+        # Display user's balance
+        balance = user_data.get('balance', 0)
+        etb_rate = db.get_currency_rate("etb", 30.0)
+        etb_balance = balance * etb_rate
+        
+        # Format ETB with thousands separator
+        formatted_etb = f"{etb_balance:,.0f}"
+        
+        update.message.reply_text(
+            f"User: {user_data.get('first_name', '')} {user_data.get('last_name', '')}\n"
+            f"Username: {username_display}\n"
+            f"Current balance: ${balance:.2f} (≈ETB {formatted_etb})"
+        )
+        # Offer action buttons
+        keyboard = [
+            [InlineKeyboardButton("➕ Add Balance", callback_data='admin_add_balance')],
+            [InlineKeyboardButton("➖ Remove Balance", callback_data='admin_remove_balance')],
+            [InlineKeyboardButton("« Back to Admin Menu", callback_data='admin_back_to_menu')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        update.message.reply_text("What would you like to do?", reply_markup=reply_markup)
+        return ADMIN_MENU
+        
+    elif admin_action == 'check_referrals':
+        # Show user's referrals
+        return show_user_referrals(update, context, user_id)
+        
+    else:
+        # Unknown action
+        update.message.reply_text("❌ Unknown action. Please try again.")
+        return ConversationHandler.END
+
+def handle_balance_amount(update: Update, context: CallbackContext):
+    """Handle balance amount input for adding balance to a user"""
+    # Check both possible variable names to maintain compatibility
+    target_user_id = context.user_data.get("admin_target_user_id") or context.user_data.get("target_user_id")
+    user_data = context.user_data.get('target_user_data')
+    
+    if not target_user_id or not user_data:
+        update.message.reply_text("Error: No target user selected. Please try again.")
+        return ConversationHandler.END
+    
+    # Store the user_id in both formats to ensure compatibility
+    context.user_data["admin_target_user_id"] = target_user_id
+    context.user_data["target_user_id"] = target_user_id
+    
+    # Get username for display
+    username = user_data.get('username', 'None')
+    username_display = f"@{username}" if username else "No username"
+    
+    # Parse the input to extract amount and currency
+    input_text = update.message.text.strip()
+    
+    # Check if input contains currency specification
+    currency = "USD"  # Default currency
+    amount_str = input_text
+    
+    # Check for common currency formats
+    if " etb" in input_text.lower():
+        currency = "ETB"
+        amount_str = input_text.lower().replace(" etb", "").strip()
+    elif "etb " in input_text.lower():
+        currency = "ETB"
+        amount_str = input_text.lower().replace("etb ", "").strip()
+    elif "etb" in input_text.lower():
+        currency = "ETB"
+        amount_str = input_text.lower().replace("etb", "").strip()
+    elif " usd" in input_text.lower():
+        currency = "USD"
+        amount_str = input_text.lower().replace(" usd", "").strip()
+    elif "usd " in input_text.lower():
+        currency = "USD"
+        amount_str = input_text.lower().replace("usd ", "").strip()
+    elif "usd" in input_text.lower():
+        currency = "USD"
+        amount_str = input_text.lower().replace("usd", "").strip()
+    elif "$" in input_text:
+        currency = "USD"
+        amount_str = input_text.replace("$", "").strip()
+    
+    # Store detected currency
+    context.user_data["admin_balance_currency"] = currency
+    
+    try:
+        # Try to parse the amount
+        amount = float(amount_str)
+        if amount <= 0:
+            update.message.reply_text("Please enter a positive amount.")
+            return ENTERING_BALANCE_AMOUNT
+        
+        # Store amount in context for confirmation
+        context.user_data["admin_balance_amount"] = amount
+        
+        # Check if this is a balance addition or removal
+        admin_action = context.user_data.get('admin_action')
+        
+        # Get the ETB rate from database with fallback to constants
+        etb_rate = db.get_currency_rate("etb", CURRENCY_RATES.get("ETB", 30.0))
+        
+        # Get equivalent value in both currencies for display
+        if currency == "ETB":
+            etb_amount = amount
+            usd_amount = amount / etb_rate
+            amount_display = f"ETB {etb_amount:.2f} (≈${usd_amount:.2f})"
+        else:
+            usd_amount = amount
+            etb_amount = amount * etb_rate
+            amount_display = f"${usd_amount:.2f} (≈ETB {etb_amount:.2f})"
+        
+        if admin_action == "remove_balance":
+            # Create confirmation keyboard for removal
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Confirm & Notify", callback_data="confirm_remove_balance"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="cancel_remove_balance")
+                ],
+                [
+                    InlineKeyboardButton("🔕 Silent Removal (No Notification)", callback_data="confirm_remove_balance_silent")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # Show confirmation message for removal
+            update.message.reply_html(
+                f"💰 <b>Confirm Balance Removal</b>\n\n"
+                f"User ID: <code>{target_user_id}</code>\n"
+                f"Username: {username_display}\n"
+                f"Amount: <code>{amount_display}</code>\n\n"
+                f"Choose an option:\n"
+                f"• <b>Confirm & Notify</b>: Remove balance and notify the user\n"
+                f"• <b>Silent Removal</b>: Remove balance without notification\n"
+                f"• <b>Cancel</b>: Cancel this operation",
+                reply_markup=reply_markup
+            )
+            
+            # Return REMOVING_BALANCE_OPTIONS state instead of ADMIN_MENU
+            return REMOVING_BALANCE_OPTIONS
+        else:
+            # Create confirmation keyboard for addition
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Confirm & Notify", callback_data="confirm_add_balance"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="cancel_add_balance")
+                ],
+                [
+                    InlineKeyboardButton("🔕 Silent Addition (No Notification)", callback_data="confirm_add_balance_silent")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # Show confirmation message for addition
+            update.message.reply_html(
+                f"💰 <b>Confirm Balance Addition</b>\n\n"
+                f"User ID: <code>{target_user_id}</code>\n"
+                f"Username: {username_display}\n"
+                f"Amount: <code>{amount_display}</code>\n\n"
+                f"Choose an option:\n"
+                f"• <b>Confirm & Notify</b>: Add balance and notify the user\n"
+                f"• <b>Silent Addition</b>: Add balance without notification\n"
+                f"• <b>Cancel</b>: Cancel this operation",
+                reply_markup=reply_markup
+            )
+        
+            # Return ADDING_BALANCE state instead of ADMIN_MENU
+            return ADDING_BALANCE
+        
+    except ValueError:
+        update.message.reply_text("Please enter a valid number. You can specify currency by adding 'USD' or 'ETB' (e.g., '10 USD' or '300 ETB').")
+        return ENTERING_BALANCE_AMOUNT
+
+def confirm_add_balance(update: Update, context: CallbackContext):
+    """Handle balance addition confirmation"""
+    query = update.callback_query
+    query.answer()
+    
+    is_silent = False
+    
+    if query.data == "confirm_add_balance" or query.data == "confirm_add_balance_silent":
+        is_silent = (query.data == "confirm_add_balance_silent")
+        target_user_id = context.user_data.get("admin_target_user_id")
+        amount = context.user_data.get("admin_balance_amount")
+        currency = context.user_data.get("admin_balance_currency", "USD")
+        
+        if not target_user_id or amount is None:
+            query.edit_message_text("❌ Error: Missing user ID or amount. Please try again.")
+            return ConversationHandler.END
+        
+        # Get ETB rate for conversion
+        etb_rate = db.get_currency_rate("etb", CURRENCY_RATES.get("ETB", 30.0))
+        
+        # Add balance to user's account with currency
+        reason = f"Admin balance addition by {update.effective_user.id}" if not is_silent else f"Admin silent balance addition"
+        if db.add_balance(target_user_id, amount, reason, currency, silent=is_silent):
+            new_balance = db.get_balance(target_user_id)
+            etb_balance = new_balance * etb_rate
+            
+            # Format the display message based on original currency
+            if currency == "ETB":
+                amount_display = f"ETB {amount:.2f}"
+            else:
+                amount_display = f"${amount:.2f}"
+                
+            notification_status = "🔕 No notification sent" if is_silent else "🔔 User notified"
+            query.edit_message_text(
+                f"✅ Successfully added {amount_display} to user {target_user_id}\n"
+                f"New balance: ${new_balance:.2f} (≈ETB {etb_balance:.2f})\n"
+                f"{notification_status}",
+                parse_mode="HTML"
+            )
+        else:
+            query.edit_message_text("❌ Failed to add balance. Please try again.")
+    elif query.data == "cancel_add_balance":
+        query.edit_message_text("❌ Balance addition cancelled.")
+    
+    # Clear the stored data
+    context.user_data.pop("admin_target_user_id", None)
+    context.user_data.pop("admin_balance_amount", None)
+    context.user_data.pop("admin_balance_currency", None)
+    
+    return ConversationHandler.END
+
+def confirm_remove_balance(update: Update, context: CallbackContext):
+    """Handle balance removal confirmation"""
+    query = update.callback_query
+    query.answer()
+    
+    is_silent = False
+    remove_all = False
+    
+    if query.data in ["confirm_remove_balance", "confirm_remove_balance_silent", 
+                      "confirm_remove_all_balance", "confirm_remove_all_balance_silent"]:
+        
+        is_silent = "silent" in query.data
+        remove_all = "all" in query.data
+        target_user_id = context.user_data.get("admin_target_user_id")
+        
+        if not target_user_id:
+            query.edit_message_text("❌ Error: Missing user ID. Please try again.")
+            return ConversationHandler.END
+        
+        # Get current balance
+        current_balance = db.get_balance(target_user_id)
+        
+        # Get ETB rate for conversion
+        etb_rate = db.get_currency_rate("etb", CURRENCY_RATES.get("ETB", 30.0))
+        
+        if remove_all:
+            # Remove all balance
+            if current_balance > 0:
+                reason = f"Admin full balance removal by {update.effective_user.id}" if not is_silent else f"Admin silent full balance removal"
+                if db.deduct_balance(target_user_id, current_balance, reason, "USD", silent=is_silent):
+                    notification_status = "🔕 No notification sent" if is_silent else "🔔 User notified"
+                    query.edit_message_text(
+                        f"✅ Successfully removed all balance (${current_balance:.2f}) from user {target_user_id}\n"
+                        f"New balance: $0.00\n"
+                        f"{notification_status}",
+                        parse_mode="HTML"
+                    )
+                else:
+                    query.edit_message_text("❌ Failed to remove balance. Please try again.")
+        else:
+            # Remove specific amount
+            amount = context.user_data.get("admin_balance_amount")
+            currency = context.user_data.get("admin_balance_currency", "USD")
+            
+            if amount is None:
+                query.edit_message_text("❌ Error: Missing amount. Please try again.")
+                return ConversationHandler.END
+            
+            # Convert amount to USD if needed
+            if currency == "ETB":
+                usd_amount = amount / etb_rate
+            else:
+                usd_amount = amount
+            
+            # Ensure we don't remove more than available
+            if usd_amount > current_balance:
+                usd_amount = current_balance
+            
+            # Remove the balance
+            reason = f"Admin balance removal by {update.effective_user.id}" if not is_silent else f"Admin silent balance removal"
+            if db.deduct_balance(target_user_id, usd_amount, reason, "USD", silent=is_silent):
+                new_balance = db.get_balance(target_user_id)
+                etb_balance = new_balance * etb_rate
+                
+                # Format amount display
+                if currency == "ETB":
+                    amount_display = f"ETB {amount:.2f}"
+                else:
+                    amount_display = f"${usd_amount:.2f}"
+                
+                notification_status = "🔕 No notification sent" if is_silent else "🔔 User notified"
+                query.edit_message_text(
+                    f"✅ Successfully removed {amount_display} from user {target_user_id}\n"
+                    f"New balance: ${new_balance:.2f} (≈ETB {etb_balance:.2f})\n"
+                    f"{notification_status}",
+                    parse_mode="HTML"
+                )
+            else:
+                query.edit_message_text("❌ Failed to remove balance. Please try again.")
+    
+    elif query.data == "cancel_remove_balance":
+        query.edit_message_text("❌ Balance removal cancelled.")
+    
+    # Clear the stored data
+    context.user_data.pop("admin_target_user_id", None)
+    context.user_data.pop("admin_balance_amount", None)
+    context.user_data.pop("admin_balance_currency", None)
+    context.user_data.pop("target_user_data", None)
+    
+    return ConversationHandler.END
+
+def handle_remove_balance_options(update: Update, context: CallbackContext):
+    """Handle remove balance option selection"""
+    query = update.callback_query
+    query.answer()
+    
+    option = query.data
+    target_user_id = context.user_data.get("admin_target_user_id")
+    user_data = context.user_data.get('target_user_data')
+    
+    if not target_user_id or not user_data:
+        query.edit_message_text("❌ Error: No user selected. Please try again.")
+        return ConversationHandler.END
+    
+    current_balance = user_data.get('balance', 0)
+    username = user_data.get('username', 'None')
+    username_display = f"@{username}" if username else "No username"
+    
+    if option == "admin_remove_all_balance":
+        # Create confirmation keyboard for removing all balance
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Confirm & Notify", callback_data="confirm_remove_all_balance"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel_remove_balance")
+            ],
+            [
+                InlineKeyboardButton("🔕 Silent Removal (No Notification)", callback_data="confirm_remove_all_balance_silent")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            f"<b>⚠️ Remove All Balance</b>\n\n"
+            f"User: <code>{user_data.get('first_name', '')} {user_data.get('last_name', '')}</code>\n"
+            f"Username: {username_display}\n"
+            f"Current Balance: <code>${current_balance:.2f}</code>\n\n"
+            f"Choose an option:\n"
+            f"• <b>Confirm & Notify</b>: Remove ALL balance and notify the user\n"
+            f"• <b>Silent Removal</b>: Remove ALL balance without notification\n"
+            f"• <b>Cancel</b>: Cancel this operation",
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+        return REMOVING_BALANCE_OPTIONS
+        
+    elif option == "admin_remove_custom_balance":
+        etb_rate = db.get_currency_rate("etb", CURRENCY_RATES.get("ETB", 30.0))
+        etb_balance = current_balance * etb_rate
+        formatted_etb = f"{etb_balance:,.0f}"
+        
+        query.edit_message_text(
+            f"User found: {user_data.get('first_name', '')} {user_data.get('last_name', '')}\n"
+            f"Username: {username_display}\n"
+            f"Current balance: ${current_balance:.2f} (≈ETB {formatted_etb})\n\n"
+            f"Enter the amount to remove from the user's balance:\n"
+            f"You can specify currency by adding ETB or USD (e.g., '10 USD' or '300 ETB')"
+        )
+        return ENTERING_BALANCE_AMOUNT
+        
+    return REMOVING_BALANCE_OPTIONS
+
+def handle_remove_balance_amount(update: Update, context: CallbackContext):
+    """Handle balance amount input for removing balance from a user"""
+    target_user_id = context.user_data.get("admin_target_user_id")
+    user_data = context.user_data.get('target_user_data')
+    
+    if not target_user_id or not user_data:
+        update.message.reply_text("Error: No target user selected. Please try again.")
+        return ConversationHandler.END
+    
+    current_balance = user_data.get('balance', 0)
+    
+    # Parse the input to extract amount and currency
+    input_text = update.message.text.strip()
+    
+    # Check if input contains currency specification
+    currency = "USD"  # Default currency
+    amount_str = input_text
+    
+    # Check for common currency formats
+    if " etb" in input_text.lower():
+        currency = "ETB"
+        amount_str = input_text.lower().replace(" etb", "").strip()
+    elif "etb " in input_text.lower():
+        currency = "ETB"
+        amount_str = input_text.lower().replace("etb ", "").strip()
+    elif "etb" in input_text.lower():
+        currency = "ETB"
+        amount_str = input_text.lower().replace("etb", "").strip()
+    elif " usd" in input_text.lower():
+        currency = "USD"
+        amount_str = input_text.lower().replace(" usd", "").strip()
+    elif "usd " in input_text.lower():
+        currency = "USD"
+        amount_str = input_text.lower().replace("usd ", "").strip()
+    elif "usd" in input_text.lower():
+        currency = "USD"
+        amount_str = input_text.lower().replace("usd", "").strip()
+    elif "$" in input_text:
+        currency = "USD"
+        amount_str = input_text.replace("$", "").strip()
+    
+    # Store detected currency
+    context.user_data["admin_balance_currency"] = currency
+    
+    try:
+        # Try to parse the amount
+        amount = float(amount_str)
+        if amount <= 0:
+            update.message.reply_text("Please enter a positive amount.")
+            return ENTERING_BALANCE_AMOUNT
+            
+        # Get the ETB rate from database
+        etb_rate = db.get_currency_rate("etb", CURRENCY_RATES.get("ETB", 30.0))
+        
+        # Convert amount to USD for comparison if currency is ETB
+        if currency == "ETB":
+            usd_amount = amount / etb_rate
+        else:
+            usd_amount = amount
+            
+        if usd_amount > current_balance:
+            if currency == "ETB":
+                update.message.reply_text(
+                    f"❌ Error: The amount to remove (ETB {amount:.2f} ≈ ${usd_amount:.2f}) exceeds the user's current balance (${current_balance:.2f}).\n"
+                    f"Please enter a smaller amount or use the 'Remove All Balance' option."
+                )
+            else:
+            update.message.reply_text(
+                f"❌ Error: The amount to remove (${amount:.2f}) exceeds the user's current balance (${current_balance:.2f}).\n"
+                f"Please enter a smaller amount or use the 'Remove All Balance' option."
+            )
+            return ENTERING_BALANCE_AMOUNT
+        
+        # Store amount in context for confirmation
+        context.user_data["admin_balance_amount"] = amount
+        
+        # Format the amount display based on currency
+        if currency == "ETB":
+            etb_amount = amount
+            amount_display = f"ETB {etb_amount:.2f} (≈${usd_amount:.2f})"
+            new_balance_usd = current_balance - usd_amount
+            new_balance_etb = new_balance_usd * etb_rate
+        else:
+            usd_amount = amount
+            etb_amount = amount * etb_rate
+            amount_display = f"${usd_amount:.2f} (≈ETB {etb_amount:.2f})"
+            new_balance_usd = current_balance - usd_amount
+            new_balance_etb = new_balance_usd * etb_rate
+        
+        # Create confirmation keyboard
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Confirm", callback_data="confirm_remove_balance"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel_remove_balance")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Show confirmation message
+        update.message.reply_html(
+            f"💰 <b>Confirm Balance Removal</b>\n\n"
+            f"User ID: <code>{target_user_id}</code>\n"
+            f"Current balance: <code>${current_balance:.2f} (≈ETB {current_balance * etb_rate:.2f})</code>\n"
+            f"Amount to remove: <code>{amount_display}</code>\n"
+            f"New balance will be: <code>${new_balance_usd:.2f} (≈ETB {new_balance_etb:.2f})</code>\n\n"
+            f"Choose an option:\n"
+            f"• <b>Confirm & Notify</b>: Remove balance and notify the user\n"
+            f"• <b>Silent Removal</b>: Remove balance without notification\n"
+            f"• <b>Cancel</b>: Cancel this operation",
+            reply_markup=reply_markup
+        )
+        
+        return REMOVING_BALANCE_OPTIONS
+        
+    except ValueError:
+        update.message.reply_text("Please enter a valid number. You can specify currency by adding 'USD' or 'ETB' (e.g., '10 USD' or '300 ETB').")
+        return ENTERING_BALANCE_AMOUNT
+
+def handle_broadcast_media_type(update: Update, context: CallbackContext):
+    """Handle selection of broadcast media type"""
+    query = update.callback_query
+    query.answer()
+    
+    # Get selected media type
+    media_type = query.data.replace("broadcast_type_", "")
+    
+    # Store media type in context
+    context.user_data["broadcast_media_type"] = media_type
+    
+    if media_type == "text":
+        query.edit_message_text(
+            "📝 Broadcast Text Message\n\n"
+            "Please enter the message you want to send to all users:\n\n"
+            "You can include:\n"
+            "- Regular text\n"
+            "- HTML formatting (<b>bold</b>, <i>italic</i>, etc.)\n"
+            "- URLs will be automatically detected\n\n"
+            "Type your message:"
+        )
+        return BROADCASTING
+    
+    elif media_type == "photo":
+        query.edit_message_text(
+            "🖼️ Broadcast Photo\n\n"
+            "Please send the photo you want to broadcast to all users.\n"
+            "You can also add a caption with the photo."
+        )
+        return BROADCASTING
+    
+    elif media_type == "video":
+        query.edit_message_text(
+            "🎬 Broadcast Video\n\n"
+            "Please send the video you want to broadcast to all users.\n"
+            "You can also add a caption with the video."
+        )
+        return BROADCASTING
+    
+    elif media_type == "audio":
+        query.edit_message_text(
+            "🔊 Broadcast Voice/Audio\n\n"
+            "Please send the voice message or audio file you want to broadcast to all users.\n"
+            "You can also add a caption with the audio."
+        )
+        return BROADCASTING
+    
+    elif media_type == "document":
+        query.edit_message_text(
+            "📁 Broadcast Document/File\n\n"
+            "Please send the document or file you want to broadcast to all users.\n"
+            "You can also add a caption with the file."
+        )
+        return BROADCASTING
+        
+    elif media_type == "collection":
+        # Initialize collection in context
+        context.user_data["broadcast_collection"] = []
+        
+        # Show collection menu
+        return show_broadcast_collection_menu(update, context)
+    
+    else:
+        query.edit_message_text("❌ Invalid option selected.")
+        return ConversationHandler.END
+
+def show_broadcast_collection_menu(update: Update, context: CallbackContext):
+    """Show menu for creating a collection of media items to broadcast"""
+    query = update.callback_query
+    
+    # Get current collection
+    collection = context.user_data.get("broadcast_collection", [])
+    collection_size = len(collection)
+    
+    # Create message showing current collection
+    message = f"📱 <b>Media Collection</b> ({collection_size} items)\n\n"
+    
+    if collection:
+        message += "<b>Current items:</b>\n"
+        for i, item in enumerate(collection, 1):
+            item_type = item.get("type", "unknown")
+            caption = item.get("caption", "")
+            if item_type == "text":
+                preview = item.get("text", "")[:50] + "..." if len(item.get("text", "")) > 50 else item.get("text", "")
+                message += f"{i}. 📝 Text: {preview}\n"
+            elif item_type == "photo":
+                message += f"{i}. 🖼️ Photo" + (f" with caption: {caption[:20]}..." if caption else "") + "\n"
+            elif item_type == "video":
+                message += f"{i}. 🎬 Video" + (f" with caption: {caption[:20]}..." if caption else "") + "\n"
+            elif item_type == "audio":
+                message += f"{i}. 🔊 Audio" + (f" with caption: {caption[:20]}..." if caption else "") + "\n"
+            elif item_type == "document":
+                message += f"{i}. 📁 Document" + (f" with caption: {caption[:20]}..." if caption else "") + "\n"
+    else:
+        message += "Your collection is empty. Add some items to create your broadcast.\n"
+    
+    message += "\nWhat would you like to add to your collection?"
+    
+    # Create keyboard with options
+    keyboard = [
+        [InlineKeyboardButton("📝 Add Text", callback_data="add_collection_text")],
+        [InlineKeyboardButton("🖼️ Add Photo", callback_data="add_collection_photo")],
+        [InlineKeyboardButton("🎬 Add Video", callback_data="add_collection_video")],
+        [InlineKeyboardButton("🔊 Add Audio", callback_data="add_collection_audio")],
+        [InlineKeyboardButton("📁 Add Document", callback_data="add_collection_document")]
+    ]
+    
+    # Add send options if collection has items
+    if collection:
+        keyboard.append([
+            InlineKeyboardButton("📤 Preview & Send", callback_data="preview_collection"),
+            InlineKeyboardButton("🗑 Clear All", callback_data="clear_collection")
+        ])
+        if collection_size > 1:
+            keyboard.append([
+                InlineKeyboardButton("📤 Send as Separate Messages", callback_data="send_separate"),
+                InlineKeyboardButton("📤 Send as Group", callback_data="send_group")
+            ])
+    
+    # Add back button
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="admin_broadcast")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if query:
+        query.edit_message_text(message, reply_markup=reply_markup, parse_mode="HTML")
+        else:
